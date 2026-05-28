@@ -20,6 +20,7 @@ type ReceiveConfig struct {
 	OnSendACK             func(seq circular.Number, light bool)
 	OnSendNAK             func(from, to circular.Number)
 	OnDeliver             func(p packet.Packet)
+	LossMaxTTL            uint32 // number of packets to wait before sending NAK (0 = immediate, like default SRT)
 }
 
 // receiver implements the Receiver interface
@@ -63,6 +64,13 @@ type receiver struct {
 	sendACK func(seq circular.Number, light bool)
 	sendNAK func(from, to circular.Number)
 	deliver func(p packet.Packet)
+
+	// LossMaxTTL: reorder tolerance (BELABOX-style)
+	lossMaxTTL            uint32 // max packets to wait before NAK (0 = immediate)
+	hasPendingNAK         bool   // whether a deferred NAK is active
+	pendingNAKFrom        circular.Number // start of deferred NAK range
+	pendingNAKTo          circular.Number // end of deferred NAK range
+	pendingNAKPacketCount uint32          // packets received since gap was first detected
 }
 
 // NewReceiver takes a ReceiveConfig and returns a new Receiver
@@ -77,6 +85,8 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 		periodicNAKInterval: config.PeriodicNAKInterval,
 
 		avgPayloadSize: 1456, //  5.1.2. SRT's Default LiveCC Algorithm
+
+		lossMaxTTL: config.LossMaxTTL,
 
 		sendACK: config.OnSendACK,
 		sendNAK: config.OnSendNAK,
@@ -225,19 +235,55 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 				r.packetList.InsertBefore(pkt, e)
 
+				// LossMaxTTL: check if this packet fills the pending NAK gap
+				if r.lossMaxTTL > 0 && r.hasPendingNAK {
+					if pkt.Header().PacketSequenceNumber.Gte(r.pendingNAKFrom) && pkt.Header().PacketSequenceNumber.Lte(r.pendingNAKTo) {
+						// This packet is within the pending NAK range, check if gap is now filled
+						if r.isGapFilled() {
+							r.clearPendingNAK()
+						}
+					}
+				}
+
 				break
 			}
 		}
 
 		return
 	} else {
-		// Too far ahead, there are some missing sequence numbers, immediate NAK report
-		// here we can prevent a possibly unnecessary NAK with SRTO_LOXXMAXTTL
-		r.sendNAK(r.maxSeenSequenceNumber.Inc(), pkt.Header().PacketSequenceNumber.Dec())
+		// Too far ahead, there are some missing sequence numbers
+		naFrom := r.maxSeenSequenceNumber.Inc()
+		naTo := pkt.Header().PacketSequenceNumber.Dec()
 
-		len := uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber))
-		r.statistics.PktLoss += len
-		r.statistics.ByteLoss += len * uint64(r.avgPayloadSize)
+		if r.lossMaxTTL > 0 {
+			// LossMaxTTL: defer NAK and wait for reordered packets
+			if !r.hasPendingNAK {
+				// First gap detected, start tracking
+				r.pendingNAKFrom = naFrom
+				r.pendingNAKTo = naTo
+				r.hasPendingNAK = true
+				r.pendingNAKPacketCount = 0
+			} else {
+				// Extend pending range if this creates a bigger gap
+				if naTo.Gt(r.pendingNAKTo) {
+					r.pendingNAKTo = naTo
+				}
+			}
+			r.pendingNAKPacketCount++
+
+			// Check if threshold exceeded → send NAK now
+			if r.pendingNAKPacketCount >= r.lossMaxTTL {
+				r.sendNAK(r.pendingNAKFrom, r.pendingNAKTo)
+				r.clearPendingNAK()
+			}
+		} else {
+			// No LossMaxTTL: immediate NAK (original behavior)
+			r.sendNAK(naFrom, naTo)
+		}
+
+		l := uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber))
+		r.statistics.PktLoss += l
+		r.statistics.ByteLoss += l * uint64(r.avgPayloadSize)
 
 		r.maxSeenSequenceNumber = pkt.Header().PacketSequenceNumber
 	}
@@ -343,6 +389,15 @@ func (r *receiver) periodicNAK(now uint64) (ok bool, from, to circular.Number) {
 		if !p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
 			nackSequenceNumber := ackSequenceNumber.Inc()
 
+			// LossMaxTTL: skip this gap if it's still within the deferred NAK window
+			if r.lossMaxTTL > 0 && r.hasPendingNAK {
+				if nackSequenceNumber.Gte(r.pendingNAKFrom) && nackSequenceNumber.Lte(r.pendingNAKTo) {
+					// This gap is being tracked by LossMaxTTL, skip it in periodic NAK
+					ackSequenceNumber = p.Header().PacketSequenceNumber
+					continue
+				}
+			}
+
 			ok = true
 			from = nackSequenceNumber
 			to = p.Header().PacketSequenceNumber.Dec()
@@ -417,6 +472,36 @@ func (r *receiver) SetNAKInterval(nakInterval uint64) {
 	defer r.lock.Unlock()
 
 	r.periodicNAKInterval = nakInterval
+}
+
+// isGapFilled checks if all packets in the pending NAK range are now in the packetList
+func (r *receiver) isGapFilled() bool {
+	if !r.hasPendingNAK {
+		return false
+	}
+
+	// Walk the list and check if all sequence numbers from pendingNAKFrom to pendingNAKTo are present
+	expected := r.pendingNAKFrom
+	for e := r.packetList.Front(); e != nil; e = e.Next() {
+		p := e.Value.(packet.Packet)
+		if p.Header().PacketSequenceNumber == expected {
+			expected = expected.Inc()
+			if expected.Gt(r.pendingNAKTo) {
+				return true // All gaps filled
+			}
+		} else if p.Header().PacketSequenceNumber.Gt(expected) {
+			return false // Still have gaps
+		}
+	}
+	return false
+}
+
+// clearPendingNAK resets the pending NAK state
+func (r *receiver) clearPendingNAK() {
+	r.hasPendingNAK = false
+	r.pendingNAKFrom = circular.Number{}
+	r.pendingNAKTo = circular.Number{}
+	r.pendingNAKPacketCount = 0
 }
 
 func (r *receiver) String(t uint64) string {
