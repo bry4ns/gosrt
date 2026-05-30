@@ -332,12 +332,6 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 			continue
 		}
 
-		// If there are packets that should have been delivered by now, move forward.
-		if p.Header().PktTsbpdTime <= now {
-			ackSequenceNumber = p.Header().PacketSequenceNumber
-			continue
-		}
-
 		// Check if the packet is the next in the row.
 		if p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
 			ackSequenceNumber = p.Header().PacketSequenceNumber
@@ -366,6 +360,10 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 func (r *receiver) periodicNAK(now uint64) (ok bool, from, to circular.Number) {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
+
+	if r.lossMaxTTL > 0 {
+		return // Disable periodic NAK when using LossMaxTTL (BELABOX approach)
+	}
 
 	if now-r.lastPeriodicNAK < r.periodicNAKInterval {
 		return
@@ -422,17 +420,30 @@ func (r *receiver) Tick(now uint64) {
 		r.sendNAK(from, to)
 	}
 
-	// Deliver packets whose PktTsbpdTime is ripe
+	// Deliver packets whose PktTsbpdTime is ripe (with loss compression / TLPKTDROP)
 	r.lock.Lock()
 	removeList := make([]*list.Element, 0, r.packetList.Len())
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
 
-		if p.Header().PacketSequenceNumber.Lte(r.lastACKSequenceNumber) && p.Header().PktTsbpdTime <= now {
+		if p.Header().PktTsbpdTime <= now {
+			expectedSN := r.lastDeliveredSequenceNumber.Inc()
+			if p.Header().PacketSequenceNumber.Gt(expectedSN) {
+				// Gap detected: declare missing packets as lost/dropped
+				gap := uint64(p.Header().PacketSequenceNumber.Distance(expectedSN))
+				r.statistics.PktDrop += gap
+				r.statistics.ByteDrop += gap * uint64(r.avgPayloadSize)
+				r.statistics.PktLoss += gap
+				r.statistics.ByteLoss += gap * uint64(r.avgPayloadSize)
+			}
+
 			r.statistics.PktBuf--
 			r.statistics.ByteBuf -= p.Len()
 
 			r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber
+			if r.lastACKSequenceNumber.Lt(r.lastDeliveredSequenceNumber) {
+				r.lastACKSequenceNumber = r.lastDeliveredSequenceNumber
+			}
 
 			r.deliver(p)
 			removeList = append(removeList, e)
