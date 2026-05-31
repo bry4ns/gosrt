@@ -54,6 +54,7 @@ type connRequest struct {
 	addr            net.Addr
 	start           time.Time
 	socketId        uint32
+	peerSocketId    uint32
 	timestamp       uint32
 	config          Config
 	handshake       *packet.CIFHandshake
@@ -231,13 +232,14 @@ func newConnRequest(ln *listener, p packet.Packet) *connRequest {
 		}
 
 		req := &connRequest{
-			ln:        ln,
-			addr:      p.Header().Addr,
-			start:     time.Now(),
-			socketId:  cif.SRTSocketId,
-			timestamp: p.Header().Timestamp,
-			config:    config,
-			handshake: cif,
+			ln:           ln,
+			addr:         p.Header().Addr,
+			start:        time.Now(),
+			socketId:     cif.SRTSocketId,
+			peerSocketId: cif.SRTSocketId,
+			timestamp:    p.Header().Timestamp,
+			config:       config,
+			handshake:    cif,
 		}
 
 		if cif.SRTKM != nil {
