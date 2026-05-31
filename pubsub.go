@@ -44,7 +44,7 @@ type PubSubConfig struct {
 // this PubSub can't be used anymore.
 func NewPubSub(config PubSubConfig) PubSub {
 	pb := &pubSub{
-		incoming:  make(chan packet.Packet, 1024),
+		incoming:  make(chan packet.Packet, 8192),
 		listeners: make(map[uint32]chan packet.Packet),
 		logger:    config.Logger,
 	}
@@ -129,7 +129,7 @@ func (pb *pubSub) Publish(c Conn) error {
 }
 
 func (pb *pubSub) Subscribe(c Conn) error {
-	l := make(chan packet.Packet, 1024)
+	l := make(chan packet.Packet, 8192)
 	socketId := c.SocketId()
 
 	pb.logger.Print("pubsub:subscribe", socketId, 1, func() string { return "new subscriber" })

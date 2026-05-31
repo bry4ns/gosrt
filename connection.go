@@ -279,9 +279,9 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		rttVar: float64((50 * time.Millisecond).Microseconds()),
 	}
 
-	c.networkQueue = make(chan packet.Packet, 1024)
+	c.networkQueue = make(chan packet.Packet, 8192)
 
-	c.writeQueue = make(chan packet.Packet, 1024)
+	c.writeQueue = make(chan packet.Packet, 8192)
 	if c.version == 4 {
 		// libsrt-1.2.3 receiver doesn't like it when the payload is larger than 7*188 bytes.
 		// Here we just take a multiple of a mpegts chunk size.
@@ -291,7 +291,7 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		c.writeData = make([]byte, int(c.config.PayloadSize))
 	}
 
-	c.readQueue = make(chan packet.Packet, 1024)
+	c.readQueue = make(chan packet.Packet, 8192)
 
 	c.peerIdleTimeout = time.AfterFunc(c.config.PeerIdleTimeout, func() {
 		c.log("connection:close", func() string {
