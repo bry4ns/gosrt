@@ -20,6 +20,7 @@ type ReceiveConfig struct {
 	OnSendACK             func(seq circular.Number, light bool)
 	OnSendNAK             func(from, to circular.Number)
 	OnDeliver             func(p packet.Packet)
+	LossMaxTTL            uint32
 }
 
 // receiver implements the Receiver interface
@@ -34,6 +35,7 @@ type receiver struct {
 
 	periodicACKInterval uint64 // config
 	periodicNAKInterval uint64 // config
+	lossMaxTTL            uint32 // config: reorder tolerance
 
 	lastPeriodicACK uint64
 	lastPeriodicNAK uint64
@@ -75,6 +77,7 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 
 		periodicACKInterval: config.PeriodicACKInterval,
 		periodicNAKInterval: config.PeriodicNAKInterval,
+		lossMaxTTL:            config.LossMaxTTL,
 
 		avgPayloadSize: 1456, //  5.1.2. SRT's Default LiveCC Algorithm
 
@@ -233,7 +236,9 @@ func (r *receiver) Push(pkt packet.Packet) {
 	} else {
 		// Too far ahead, there are some missing sequence numbers, immediate NAK report
 		// here we can prevent a possibly unnecessary NAK with SRTO_LOXXMAXTTL
-		r.sendNAK(r.maxSeenSequenceNumber.Inc(), pkt.Header().PacketSequenceNumber.Dec())
+		if r.lossMaxTTL == 0 || uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber)) > uint64(r.lossMaxTTL) {
+			r.sendNAK(r.maxSeenSequenceNumber.Inc(), pkt.Header().PacketSequenceNumber.Dec())
+		}
 
 		len := uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber))
 		r.statistics.PktLoss += len

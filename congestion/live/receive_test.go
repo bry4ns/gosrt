@@ -17,6 +17,7 @@ func mockLiveRecv(onSendACK func(seq circular.Number, light bool), onSendNAK fun
 		OnSendACK:             onSendACK,
 		OnSendNAK:             onSendNAK,
 		OnDeliver:             onDeliver,
+		LossMaxTTL:            0,
 	})
 
 	return recv.(*receiver)
@@ -621,4 +622,59 @@ func TestIssue67(t *testing.T) {
 	recv.Tick(130)
 
 	require.Equal(t, []uint32{1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 13, 13}, ackNumbers)
+}
+
+func TestRecvLossMaxTTL(t *testing.T) {
+	nNAK := 0
+	seqNAKFrom := uint32(0)
+	seqNAKTo := uint32(0)
+
+	recv := NewReceiver(ReceiveConfig{
+		InitialSequenceNumber: circular.New(0, packet.MAX_SEQUENCENUMBER),
+		PeriodicACKInterval:   10,
+		PeriodicNAKInterval:   20,
+		OnSendACK:             nil,
+		OnSendNAK: func(from, to circular.Number) {
+			nNAK++
+			seqNAKFrom = from.Val()
+			seqNAKTo = to.Val()
+		},
+		OnDeliver:             nil,
+		LossMaxTTL:            30, // tolerar desorden hasta 30 paquetes
+	}).(*receiver)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	// 1. Envía paquetes en orden de 0 a 4
+	for i := 0; i < 5; i++ {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(uint32(i), packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+		recv.Push(p)
+	}
+
+	require.Equal(t, 0, nNAK)
+	require.Equal(t, uint32(4), recv.maxSeenSequenceNumber.Val())
+
+	// 2. Envía un paquete con un salto pequeño (de 4 a 15, brecha = 10 paquetes)
+	// Como la brecha (10) es menor o igual a LossMaxTTL (30), NO debe enviar NAK inmediato
+	p := packet.NewPacket(addr)
+	p.Header().PacketSequenceNumber = circular.New(15, packet.MAX_SEQUENCENUMBER)
+	p.Header().PktTsbpdTime = 16
+	recv.Push(p)
+
+	require.Equal(t, 0, nNAK) // No NAK inmediato!
+	require.Equal(t, uint32(15), recv.maxSeenSequenceNumber.Val())
+
+	// 3. Envía un paquete con un salto grande (de 15 a 50, brecha = 34 paquetes)
+	// Como la brecha (34) es mayor que LossMaxTTL (30), SÍ debe enviar NAK inmediato
+	p2 := packet.NewPacket(addr)
+	p2.Header().PacketSequenceNumber = circular.New(50, packet.MAX_SEQUENCENUMBER)
+	p2.Header().PktTsbpdTime = 51
+	recv.Push(p2)
+
+	require.Equal(t, 1, nNAK) // Se envió un NAK inmediato!
+	require.Equal(t, uint32(16), seqNAKFrom)
+	require.Equal(t, uint32(49), seqNAKTo)
+	require.Equal(t, uint32(50), recv.maxSeenSequenceNumber.Val())
 }
