@@ -311,7 +311,6 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		OnSendACK:             c.sendACK,
 		OnSendNAK:             c.sendNAK,
 		OnDeliver:             c.deliver,
-		LossMaxTTL:            c.config.LossMaxTTL,
 	})
 
 	// 4.6.  Too-Late Packet Drop -> 125% of SRT latency, at least 1 second

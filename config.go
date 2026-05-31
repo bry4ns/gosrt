@@ -638,8 +638,6 @@ func (c *Config) Validate() error {
 	}
 
 	c.Congestion = "live"
-	c.NAKReport = true
-	c.TooLatePacketDrop = true
 	c.TSBPDMode = true
 
 	if c.Congestion != "live" {
@@ -685,10 +683,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: MSS must be between %d and %d (both inclusive)", MIN_MSS_SIZE, MAX_MSS_SIZE)
 	}
 
-	if !c.NAKReport {
-		return fmt.Errorf("config: NAKReport must be enabled")
-	}
-
 	if c.OverheadBW < 10 || c.OverheadBW > 100 {
 		return fmt.Errorf("config: OverheadBW must be between 10 and 100")
 	}
@@ -729,10 +723,6 @@ func (c *Config) Validate() error {
 
 	if len(c.StreamId) > MAX_STREAMID_SIZE {
 		return fmt.Errorf("config: StreamId must be shorter than or equal to %d bytes", MAX_STREAMID_SIZE)
-	}
-
-	if !c.TooLatePacketDrop {
-		return fmt.Errorf("config: TooLatePacketDrop must be enabled")
 	}
 
 	if c.TransmissionType != "live" {
