@@ -292,8 +292,8 @@ func openWriter(addr string, logger srt.Logger) (io.WriteCloser, error) {
 		return NewNonblockingWriter(os.Stdout, 2048), nil
 	}
 
-	if strings.HasPrefix(addr, "file://") {
-		path := strings.TrimPrefix(addr, "file://")
+	if after, ok := strings.CutPrefix(addr, "file://"); ok {
+		path := after
 		file, err := os.Create(path)
 		if err != nil {
 			return nil, err

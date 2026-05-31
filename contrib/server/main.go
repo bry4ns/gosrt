@@ -159,8 +159,8 @@ func (s *server) handleConnect(req srt.ConnRequest) srt.ConnType {
 		if strings.HasPrefix(streamId, "publish:") {
 			mode = srt.PUBLISH
 			path = strings.TrimPrefix(streamId, "publish:")
-		} else if strings.HasPrefix(streamId, "subscribe:") {
-			path = strings.TrimPrefix(streamId, "subscribe:")
+		} else if after, ok := strings.CutPrefix(streamId, "subscribe:"); ok {
+			path = after
 		}
 
 		u, err := url.Parse(path)

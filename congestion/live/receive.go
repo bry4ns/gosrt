@@ -18,7 +18,7 @@ type ReceiveConfig struct {
 	PeriodicACKInterval   uint64 // microseconds
 	PeriodicNAKInterval   uint64 // microseconds
 	OnSendACK             func(seq circular.Number, light bool)
-	OnSendNAK             func(from, to circular.Number)
+	OnSendNAK             func(list []circular.Number)
 	OnDeliver             func(p packet.Packet)
 	LossMaxTTL            uint32
 }
@@ -63,7 +63,7 @@ type receiver struct {
 	}
 
 	sendACK func(seq circular.Number, light bool)
-	sendNAK func(from, to circular.Number)
+	sendNAK func(list []circular.Number)
 	deliver func(p packet.Packet)
 }
 
@@ -91,7 +91,7 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 	}
 
 	if r.sendNAK == nil {
-		r.sendNAK = func(from, to circular.Number) {}
+		r.sendNAK = func(list []circular.Number) {}
 	}
 
 	if r.deliver == nil {
@@ -237,7 +237,10 @@ func (r *receiver) Push(pkt packet.Packet) {
 		// Too far ahead, there are some missing sequence numbers, immediate NAK report
 		// here we can prevent a possibly unnecessary NAK with SRTO_LOXXMAXTTL
 		if r.lossMaxTTL == 0 || uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber)) > uint64(r.lossMaxTTL) {
-			r.sendNAK(r.maxSeenSequenceNumber.Inc(), pkt.Header().PacketSequenceNumber.Dec())
+			r.sendNAK([]circular.Number{
+				r.maxSeenSequenceNumber.Inc(),
+				pkt.Header().PacketSequenceNumber.Dec(),
+			})
 		}
 
 		len := uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber))
@@ -301,6 +304,7 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 		if p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
 			ackSequenceNumber = p.Header().PacketSequenceNumber
 			maxPktTsbpdTime = p.Header().PktTsbpdTime
+			r.statistics.MsBuf = (maxPktTsbpdTime - minPktTsbpdTime) / 1_000
 			continue
 		}
 
@@ -317,25 +321,25 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 	r.lastPeriodicACK = now
 	r.nPackets = 0
 
-	r.statistics.MsBuf = (maxPktTsbpdTime - minPktTsbpdTime) / 1_000
-
 	return
 }
 
-func (r *receiver) periodicNAK(now uint64) (ok bool, from, to circular.Number) {
+func (r *receiver) periodicNAK(now uint64) []circular.Number {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 
 	if now-r.lastPeriodicNAK < r.periodicNAKInterval {
-		return
+		return nil
 	}
+
+	list := []circular.Number{}
 
 	// Send a periodic NAK
 
 	ackSequenceNumber := r.lastACKSequenceNumber
 
-	// Send a NAK only for the first gap.
-	// Alternatively send a NAK for max. X gaps because the size of the NAK packet is limited.
+	// Send a NAK for all gaps.
+	// Not all gaps might get announced because the size of the NAK packet is limited.
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
 
@@ -348,11 +352,8 @@ func (r *receiver) periodicNAK(now uint64) (ok bool, from, to circular.Number) {
 		if !p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
 			nackSequenceNumber := ackSequenceNumber.Inc()
 
-			ok = true
-			from = nackSequenceNumber
-			to = p.Header().PacketSequenceNumber.Dec()
-
-			break
+			list = append(list, nackSequenceNumber)
+			list = append(list, p.Header().PacketSequenceNumber.Dec())
 		}
 
 		ackSequenceNumber = p.Header().PacketSequenceNumber
@@ -360,7 +361,7 @@ func (r *receiver) periodicNAK(now uint64) (ok bool, from, to circular.Number) {
 
 	r.lastPeriodicNAK = now
 
-	return
+	return list
 }
 
 func (r *receiver) Tick(now uint64) {
@@ -368,8 +369,8 @@ func (r *receiver) Tick(now uint64) {
 		r.sendACK(sequenceNumber, lite)
 	}
 
-	if ok, from, to := r.periodicNAK(now); ok {
-		r.sendNAK(from, to)
+	if list := r.periodicNAK(now); len(list) != 0 {
+		r.sendNAK(list)
 	}
 
 	// Deliver packets whose PktTsbpdTime is ripe

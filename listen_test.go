@@ -401,7 +401,7 @@ func TestListenAsync(t *testing.T) {
 	listenerWg.Add(parallelCount)
 	pendingWg.Add(parallelCount)
 	connectedWg.Add(parallelCount)
-	for i := 0; i < parallelCount; i++ {
+	for i := range parallelCount {
 		go func() {
 			defer listenerWg.Done()
 			for {
@@ -570,12 +570,8 @@ func TestListenParallelRequests(t *testing.T) {
 
 	var clientSideConnReady sync.WaitGroup
 
-	for i := 0; i < 4; i++ {
-		clientSideConnReady.Add(1)
-
-		go func() {
-			defer clientSideConnReady.Done()
-
+	for range 4 {
+		clientSideConnReady.Go(func() {
 			config := DefaultConfig()
 			config.StreamId = "foobar"
 
@@ -584,7 +580,7 @@ func TestListenParallelRequests(t *testing.T) {
 
 			err = conn.Close()
 			require.NoError(t, err)
-		}()
+		})
 	}
 
 	serverSideConnReady.Wait()
@@ -618,7 +614,7 @@ func TestListenDiscardRepeatedHandshakes(t *testing.T) {
 		}
 	}()
 
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		conn, err := net.Dial("udp", "127.0.0.1:6003")
 		require.NoError(t, err)
 		defer conn.Close()
@@ -701,6 +697,34 @@ func TestListenDiscardRepeatedHandshakes(t *testing.T) {
 	<-singleReqReceived
 }
 
+func TestListenMultipleIPs(t *testing.T) {
+	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	require.NoError(t, err)
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+
+	go func() {
+		defer close(serverDone)
+
+		req, err := ln.Accept2()
+		require.NoError(t, err)
+
+		conn, err := req.Accept()
+		require.NoError(t, err)
+		defer conn.Close()
+
+		localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+		require.True(t, ok)
+		require.Equal(t, "127.0.0.1", localAddr.IP.String())
+	}()
+
+	clientConn, err := Dial("srt", "127.0.0.1:6003", DefaultConfig())
+	require.NoError(t, err)
+	defer clientConn.Close()
+
+	<-serverDone
+}
 func TestListenAcceptAndDiscardRepeatedHandshakes(t *testing.T) {
 	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
 	require.NoError(t, err)
@@ -824,6 +848,17 @@ func TestListenAcceptAndDiscardRepeatedHandshakes(t *testing.T) {
 	// write conclusion request, again
 	_, err = conn.Write(buf.Bytes())
 	require.NoError(t, err)
+
+	// read conclusion response, again (must receive the duplicated response robustly)
+	n, err = conn.Read(inbuf)
+	require.NoError(t, err)
+	p, err = packet.NewPacketFromData(conn.RemoteAddr(), inbuf[:n])
+	require.NoError(t, err)
+	recvcif = &packet.CIFHandshake{}
+	err = p.UnmarshalCIF(recvcif)
+	require.NoError(t, err)
+	require.Equal(t, packet.HSTYPE_CONCLUSION, recvcif.HandshakeType)
+	require.False(t, recvcif.IsRequest)
 
 	// wait some time to make sure that close(singleReqAccepted) is not triggered
 	time.Sleep(500 * time.Millisecond)

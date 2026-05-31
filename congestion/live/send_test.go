@@ -27,7 +27,7 @@ func TestSendSequence(t *testing.T) {
 
 	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		p := packet.NewPacket(addr)
 		p.Header().PktTsbpdTime = uint64(i + 1)
 
@@ -48,7 +48,7 @@ func TestSendLossListACK(t *testing.T) {
 
 	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		p := packet.NewPacket(addr)
 		p.Header().PktTsbpdTime = uint64(i + 1)
 
@@ -59,7 +59,7 @@ func TestSendLossListACK(t *testing.T) {
 
 	require.Equal(t, 10, send.lossList.Len())
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		send.ACK(circular.New(uint32(i+1), packet.MAX_SEQUENCENUMBER))
 		require.Equal(t, 10-(i+1), send.lossList.Len())
 	}
@@ -77,7 +77,7 @@ func TestSendRetransmit(t *testing.T) {
 
 	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		p := packet.NewPacket(addr)
 		p.Header().PktTsbpdTime = uint64(i + 1)
 
@@ -108,7 +108,7 @@ func TestSendDrop(t *testing.T) {
 
 	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		p := packet.NewPacket(addr)
 		p.Header().PktTsbpdTime = uint64(i + 1)
 
@@ -129,7 +129,7 @@ func TestSendFlush(t *testing.T) {
 
 	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		p := packet.NewPacket(addr)
 		p.Header().PktTsbpdTime = uint64(i + 1)
 

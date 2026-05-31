@@ -125,9 +125,8 @@ func TestPubSub(t *testing.T) {
 	readerReadyWg.Wait()
 
 	writerWg := sync.WaitGroup{}
-	writerWg.Add(1)
 
-	go func() {
+	writerWg.Go(func() {
 		config := DefaultConfig()
 		config.StreamId = "publish"
 
@@ -144,9 +143,7 @@ func TestPubSub(t *testing.T) {
 
 		err = conn.Close()
 		require.NoError(t, err)
-
-		writerWg.Done()
-	}()
+	})
 
 	writerWg.Wait()
 	readerDoneWg.Wait()
