@@ -431,45 +431,11 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 }
 
 func (r *receiver) periodicNAK(now uint64) []circular.Number {
-	r.lock.RLock()
-	defer r.lock.RUnlock()
-
-	if now-r.lastPeriodicNAK < r.periodicNAKInterval {
-		return nil
-	}
-
-	list := []circular.Number{}
-
-	ackSequenceNumber := r.lastACKSequenceNumber
-
-	for e := r.packetList.Front(); e != nil; e = e.Next() {
-		p := e.Value.(packet.Packet)
-
-		if p.Header().PacketSequenceNumber.Lte(ackSequenceNumber) {
-			continue
-		}
-
-		if !p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
-			gapStart := ackSequenceNumber.Inc()
-			gapEnd := p.Header().PacketSequenceNumber.Dec()
-			gapSize := gapEnd.Distance(gapStart)
-
-			// Suppress NAK for gaps within lossMaxTTL (bonding tolerance)
-			if r.lossMaxTTL > 0 && gapSize <= r.lossMaxTTL {
-				ackSequenceNumber = p.Header().PacketSequenceNumber
-				continue
-			}
-
-			list = append(list, gapStart)
-			list = append(list, gapEnd)
-		}
-
-		ackSequenceNumber = p.Header().PacketSequenceNumber
-	}
-
-	r.lastPeriodicNAK = now
-
-	return list
+	// Periodic NAKs DISABLED for SRTLA bonding.
+	// All SRTLA implementations (BELABOX, IRLServer, manueldev) disable periodic NAKs
+	// because they cause "NAK storms" that collapse bitrate when packets are reordered
+	// across multiple bonding paths. Only gap-triggered NAKs (in Push) are sent.
+	return nil
 }
 
 // tryDeliver attempts to deliver packets from packetList in strict sequence order.
