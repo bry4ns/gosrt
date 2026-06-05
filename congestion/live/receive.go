@@ -186,6 +186,35 @@ func (r *receiver) Push(pkt packet.Packet) {
 	r.avgPayloadSize = 0.875*r.avgPayloadSize + 0.125*float64(pktLen)
 
 	if pkt.Header().PacketSequenceNumber.Lte(r.lastDeliveredSequenceNumber) {
+		// Patch B: When lossMaxTTL > 0 (SRTLA bonding), allow packets within the
+		// reorder window to be buffered instead of dropped as "belated".
+		// Without this, slow SIM packets are dropped because fast SIMs have already
+		// advanced lastDeliveredSequenceNumber past their sequence numbers.
+		if r.lossMaxTTL > 0 {
+			dist := r.lastDeliveredSequenceNumber.Distance(pkt.Header().PacketSequenceNumber)
+			if dist <= r.lossMaxTTL {
+				// Within reorder tolerance — try to insert into packetList for delivery
+				for e := r.packetList.Front(); e != nil; e = e.Next() {
+					p := e.Value.(packet.Packet)
+					if p.Header().PacketSequenceNumber == pkt.Header().PacketSequenceNumber {
+						// Duplicate, drop
+						r.statistics.PktDrop++
+						r.statistics.ByteDrop += pktLen
+						break
+					} else if p.Header().PacketSequenceNumber.Gt(pkt.Header().PacketSequenceNumber) {
+						// Insert in order
+						r.statistics.PktBuf++
+						r.statistics.PktUnique++
+						r.statistics.ByteBuf += pktLen
+						r.statistics.ByteUnique += pktLen
+						r.packetList.InsertBefore(pkt, e)
+						break
+					}
+				}
+				return
+			}
+		}
+
 		// Too old, because up until r.lastDeliveredSequenceNumber, we already delivered
 		r.statistics.PktBelated++
 		r.statistics.ByteBelated += pktLen
@@ -235,12 +264,32 @@ func (r *receiver) Push(pkt packet.Packet) {
 		return
 	} else {
 		// Too far ahead, there are some missing sequence numbers, immediate NAK report
-		// here we can prevent a possibly unnecessary NAK with SRTO_LOXXMAXTTL
+		// here we can prevent a possibly unnecessary NAK with SRTO_LOSSMAXTTL
 		if r.lossMaxTTL == 0 || uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber)) > uint64(r.lossMaxTTL) {
-			r.sendNAK([]circular.Number{
-				r.maxSeenSequenceNumber.Inc(),
-				pkt.Header().PacketSequenceNumber.Dec(),
-			})
+			// Patch C: For bonding, also check if the missing packet's TSBPD time
+			// has likely expired before sending NAK. If the missing packet's TSBPD
+			// time is still in the future, it may arrive via another bonding path.
+			sendNAK := true
+			if r.lossMaxTTL > 0 {
+				// Estimate: the missing packet's TSBPD time is roughly
+				// (this packet's TSBPD - gapSize * interPacketTime)
+				// If it's still in the future, suppress the NAK.
+				gapSize := pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber.Inc())
+				if r.avgLinkCapacity > 0 {
+					interPacketUs := 1_000_000.0 / r.avgLinkCapacity
+					estimatedMissingTsbpd := pkt.Header().PktTsbpdTime - uint64(float64(gapSize)*interPacketUs)
+					nowUs := uint64(time.Now().UnixMicro())
+					if estimatedMissingTsbpd > nowUs {
+						sendNAK = false // Packet may still arrive via bonding
+					}
+				}
+			}
+			if sendNAK {
+				r.sendNAK([]circular.Number{
+					r.maxSeenSequenceNumber.Inc(),
+					pkt.Header().PacketSequenceNumber.Dec(),
+				})
+			}
 		}
 
 		len := uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber))
@@ -308,6 +357,19 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 			continue
 		}
 
+		// Patch D: When lossMaxTTL is configured (SRTLA bonding), allow ACK to advance
+		// past gaps within reorder tolerance. Without this, lastACKSequenceNumber stalls
+		// at the first gap, preventing Tick() from delivering packets ahead of the gap.
+		if r.lossMaxTTL > 0 {
+			gapSize := p.Header().PacketSequenceNumber.Distance(ackSequenceNumber.Inc())
+			if gapSize <= r.lossMaxTTL {
+				ackSequenceNumber = p.Header().PacketSequenceNumber
+				maxPktTsbpdTime = p.Header().PktTsbpdTime
+				r.statistics.MsBuf = (maxPktTsbpdTime - minPktTsbpdTime) / 1_000
+				continue
+			}
+		}
+
 		break
 	}
 
@@ -338,7 +400,9 @@ func (r *receiver) periodicNAK(now uint64) []circular.Number {
 
 	ackSequenceNumber := r.lastACKSequenceNumber
 
-	// Send a NAK for all gaps.
+	// Send a NAK for gaps that exceed lossMaxTTL (SRTLA bonding tolerance).
+	// When lossMaxTTL > 0, gaps within tolerance are NOT NAKged immediately,
+	// giving reordered packets time to arrive via alternate bonding paths.
 	// Not all gaps might get announced because the size of the NAK packet is limited.
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
@@ -348,12 +412,23 @@ func (r *receiver) periodicNAK(now uint64) []circular.Number {
 			continue
 		}
 
-		// If this packet is not in sequence, we stop here and report that gap.
+		// If this packet is not in sequence, we stop here and report that gap
+		// only if it exceeds the reorder tolerance (lossMaxTTL).
 		if !p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
-			nackSequenceNumber := ackSequenceNumber.Inc()
+			gapStart := ackSequenceNumber.Inc()
+			gapEnd := p.Header().PacketSequenceNumber.Dec()
+			gapSize := gapEnd.Distance(gapStart)
 
-			list = append(list, nackSequenceNumber)
-			list = append(list, p.Header().PacketSequenceNumber.Dec())
+			// Patch A: When lossMaxTTL is configured, suppress NAK for gaps within tolerance.
+			// This allows reordered packets from slower bonding paths to arrive before
+			// the receiver requests retransmission. Matches BELABOX/IRLServer C SRT patch.
+			if r.lossMaxTTL > 0 && gapSize <= r.lossMaxTTL {
+				ackSequenceNumber = p.Header().PacketSequenceNumber
+				continue
+			}
+
+			list = append(list, gapStart)
+			list = append(list, gapEnd)
 		}
 
 		ackSequenceNumber = p.Header().PacketSequenceNumber
