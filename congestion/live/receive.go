@@ -65,10 +65,25 @@ type receiver struct {
 	sendACK func(seq circular.Number, light bool)
 	sendNAK func(list []circular.Number)
 	deliver func(p packet.Packet)
+
+	// Reorder buffer: delivers packets in strict sequence order.
+	// Handles SRTLA bonding where packets arrive out of order from multiple SIMs.
+	nextDeliverySeq    circular.Number                // next sequence to deliver to application
+	pendingDelivery    map[uint32]packet.Packet       // seq -> packet, buffered for delivery
+	lastDeliveryAdvance time.Time                     // when nextDeliverySeq last advanced
+	deliveryStaleMs    int                           // stale timeout in ms (from LossMaxTTL * 2)
 }
 
 // NewReceiver takes a ReceiveConfig and returns a new Receiver
 func NewReceiver(config ReceiveConfig) congestion.Receiver {
+	staleMs := int(config.LossMaxTTL) * 2
+	if staleMs < 100 {
+		staleMs = 100
+	}
+	if staleMs > 500 {
+		staleMs = 500
+	}
+
 	r := &receiver{
 		maxSeenSequenceNumber:       config.InitialSequenceNumber.Dec(),
 		lastACKSequenceNumber:       config.InitialSequenceNumber.Dec(),
@@ -77,13 +92,19 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 
 		periodicACKInterval: config.PeriodicACKInterval,
 		periodicNAKInterval: config.PeriodicNAKInterval,
-		lossMaxTTL:            config.LossMaxTTL,
+		lossMaxTTL:           config.LossMaxTTL,
 
 		avgPayloadSize: 1456, //  5.1.2. SRT's Default LiveCC Algorithm
 
 		sendACK: config.OnSendACK,
 		sendNAK: config.OnSendNAK,
 		deliver: config.OnDeliver,
+
+		// Reorder buffer init
+		nextDeliverySeq:    config.InitialSequenceNumber.Dec(),
+		pendingDelivery:    make(map[uint32]packet.Packet),
+		lastDeliveryAdvance: time.Now(),
+		deliveryStaleMs:    staleMs,
 	}
 
 	if r.sendACK == nil {
@@ -132,6 +153,7 @@ func (r *receiver) Flush() {
 	defer r.lock.Unlock()
 
 	r.packetList = r.packetList.Init()
+	r.pendingDelivery = make(map[uint32]packet.Packet)
 }
 
 func (r *receiver) Push(pkt packet.Packet) {
@@ -174,7 +196,6 @@ func (r *receiver) Push(pkt packet.Packet) {
 	r.statistics.Pkt++
 	r.statistics.Byte += pktLen
 
-	//pkt.PktTsbpdTime = pkt.Timestamp + r.delay
 	if pkt.Header().RetransmittedPacketFlag {
 		r.statistics.PktRetrans++
 		r.statistics.ByteRetrans += pktLen
@@ -185,123 +206,158 @@ func (r *receiver) Push(pkt packet.Packet) {
 	//  5.1.2. SRT's Default LiveCC Algorithm
 	r.avgPayloadSize = 0.875*r.avgPayloadSize + 0.125*float64(pktLen)
 
-	if pkt.Header().PacketSequenceNumber.Lte(r.lastDeliveredSequenceNumber) {
-		// Patch B: When lossMaxTTL > 0 (SRTLA bonding), allow packets within the
-		// reorder window to be buffered instead of dropped as "belated".
-		// Without this, slow SIM packets are dropped because fast SIMs have already
-		// advanced lastDeliveredSequenceNumber past their sequence numbers.
-		if r.lossMaxTTL > 0 {
-			dist := r.lastDeliveredSequenceNumber.Distance(pkt.Header().PacketSequenceNumber)
+	seq := pkt.Header().PacketSequenceNumber
+
+	// REORDER BUFFER: For bonding (lossMaxTTL > 0), buffer out-of-order packets
+	// and deliver in strict sequence order. This prevents H.264 corruption from
+	// packets delivered ahead of gaps.
+	if r.lossMaxTTL > 0 {
+		// Drop duplicates (already delivered)
+		if seq.Lte(r.lastDeliveredSequenceNumber) {
+			// Check if it's within the reorder window (late arrival that fills a gap)
+			dist := r.lastDeliveredSequenceNumber.Distance(seq)
 			if dist <= r.lossMaxTTL {
-				// Within reorder tolerance — try to insert into packetList for delivery
+				// Try to insert into packetList for potential delivery
+				inserted := false
 				for e := r.packetList.Front(); e != nil; e = e.Next() {
 					p := e.Value.(packet.Packet)
-					if p.Header().PacketSequenceNumber == pkt.Header().PacketSequenceNumber {
-						// Duplicate, drop
+					if p.Header().PacketSequenceNumber == seq {
 						r.statistics.PktDrop++
 						r.statistics.ByteDrop += pktLen
+						inserted = true
 						break
-					} else if p.Header().PacketSequenceNumber.Gt(pkt.Header().PacketSequenceNumber) {
-						// Insert in order
+					}
+					if p.Header().PacketSequenceNumber.Gt(seq) {
+						r.packetList.InsertBefore(pkt, e)
 						r.statistics.PktBuf++
 						r.statistics.PktUnique++
 						r.statistics.ByteBuf += pktLen
 						r.statistics.ByteUnique += pktLen
-						r.packetList.InsertBefore(pkt, e)
+						inserted = true
 						break
 					}
 				}
-				return
+				if !inserted && r.packetList.Len() == 0 {
+					// Empty list, append
+					r.packetList.PushBack(pkt)
+					r.statistics.PktBuf++
+					r.statistics.PktUnique++
+					r.statistics.ByteBuf += pktLen
+					r.statistics.ByteUnique += pktLen
+				}
+			} else {
+				r.statistics.PktBelated++
+				r.statistics.ByteBelated += pktLen
+				r.statistics.PktDrop++
+				r.statistics.ByteDrop += pktLen
 			}
+			return
 		}
 
-		// Too old, because up until r.lastDeliveredSequenceNumber, we already delivered
+		// Buffer out-of-order packets (don't deliver yet, wait for gap to complete)
+		if seq.Lt(r.maxSeenSequenceNumber) || seq.Equals(r.maxSeenSequenceNumber) {
+			// Out of order: insert into packetList sorted
+			inserted := false
+			for e := r.packetList.Front(); e != nil; e = e.Next() {
+				p := e.Value.(packet.Packet)
+				if p.Header().PacketSequenceNumber == seq {
+					r.statistics.PktDrop++
+					r.statistics.ByteDrop += pktLen
+					inserted = true
+					break
+				}
+				if p.Header().PacketSequenceNumber.Gt(seq) {
+					r.packetList.InsertBefore(pkt, e)
+					r.statistics.PktBuf++
+					r.statistics.PktUnique++
+					r.statistics.ByteBuf += pktLen
+					r.statistics.ByteUnique += pktLen
+					inserted = true
+					break
+				}
+			}
+			if !inserted {
+				r.packetList.PushBack(pkt)
+				r.statistics.PktBuf++
+				r.statistics.PktUnique++
+				r.statistics.ByteBuf += pktLen
+				r.statistics.ByteUnique += pktLen
+			}
+			return
+		}
+
+		// Gap detected: packet is ahead of maxSeen
+		if seq.Gt(r.maxSeenSequenceNumber.Inc()) {
+			// Send NAK if gap exceeds lossMaxTTL
+			if uint64(seq.Distance(r.maxSeenSequenceNumber.Inc())) > uint64(r.lossMaxTTL) {
+				r.sendNAK([]circular.Number{
+					r.maxSeenSequenceNumber.Inc(),
+					seq.Dec(),
+				})
+			}
+			r.statistics.PktLoss += uint64(seq.Distance(r.maxSeenSequenceNumber.Inc()))
+			r.statistics.ByteLoss += uint64(seq.Distance(r.maxSeenSequenceNumber.Inc())) * uint64(r.avgPayloadSize)
+		}
+
+		// In order (or ahead): update maxSeen and add to packetList
+		r.maxSeenSequenceNumber = seq
+		r.packetList.PushBack(pkt)
+		r.statistics.PktBuf++
+		r.statistics.PktUnique++
+		r.statistics.ByteBuf += pktLen
+		r.statistics.ByteUnique += pktLen
+		return
+	}
+
+	// ORIGINAL BEHAVIOR (lossMaxTTL == 0): no reorder buffer
+	if pkt.Header().PacketSequenceNumber.Lte(r.lastDeliveredSequenceNumber) {
 		r.statistics.PktBelated++
 		r.statistics.ByteBelated += pktLen
-
 		r.statistics.PktDrop++
 		r.statistics.ByteDrop += pktLen
-
 		return
 	}
 
 	if pkt.Header().PacketSequenceNumber.Lt(r.lastACKSequenceNumber) {
-		// Already acknowledged, ignoring
 		r.statistics.PktDrop++
 		r.statistics.ByteDrop += pktLen
-
 		return
 	}
 
 	if pkt.Header().PacketSequenceNumber.Equals(r.maxSeenSequenceNumber.Inc()) {
-		// In order, the packet we expected
 		r.maxSeenSequenceNumber = pkt.Header().PacketSequenceNumber
 	} else if pkt.Header().PacketSequenceNumber.Lte(r.maxSeenSequenceNumber) {
-		// Out of order, is it a missing piece? put it in the correct position
 		for e := r.packetList.Front(); e != nil; e = e.Next() {
 			p := e.Value.(packet.Packet)
-
 			if p.Header().PacketSequenceNumber == pkt.Header().PacketSequenceNumber {
-				// Already received (has been sent more than once), ignoring
 				r.statistics.PktDrop++
 				r.statistics.ByteDrop += pktLen
-
 				break
 			} else if p.Header().PacketSequenceNumber.Gt(pkt.Header().PacketSequenceNumber) {
-				// Late arrival, this fills a gap
 				r.statistics.PktBuf++
 				r.statistics.PktUnique++
-
 				r.statistics.ByteBuf += pktLen
 				r.statistics.ByteUnique += pktLen
-
 				r.packetList.InsertBefore(pkt, e)
-
 				break
 			}
 		}
-
 		return
 	} else {
-		// Too far ahead, there are some missing sequence numbers, immediate NAK report
-		// here we can prevent a possibly unnecessary NAK with SRTO_LOSSMAXTTL
 		if r.lossMaxTTL == 0 || uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber)) > uint64(r.lossMaxTTL) {
-			// Patch C: For bonding, also check if the missing packet's TSBPD time
-			// has likely expired before sending NAK. If the missing packet's TSBPD
-			// time is still in the future, it may arrive via another bonding path.
-			sendNAK := true
-			if r.lossMaxTTL > 0 {
-				// Estimate: the missing packet's TSBPD time is roughly
-				// (this packet's TSBPD - gapSize * interPacketTime)
-				// If it's still in the future, suppress the NAK.
-				gapSize := pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber.Inc())
-				if r.avgLinkCapacity > 0 {
-					interPacketUs := 1_000_000.0 / r.avgLinkCapacity
-					estimatedMissingTsbpd := pkt.Header().PktTsbpdTime - uint64(float64(gapSize)*interPacketUs)
-					nowUs := uint64(time.Now().UnixMicro())
-					if estimatedMissingTsbpd > nowUs {
-						sendNAK = false // Packet may still arrive via bonding
-					}
-				}
-			}
-			if sendNAK {
-				r.sendNAK([]circular.Number{
-					r.maxSeenSequenceNumber.Inc(),
-					pkt.Header().PacketSequenceNumber.Dec(),
-				})
-			}
+			r.sendNAK([]circular.Number{
+				r.maxSeenSequenceNumber.Inc(),
+				pkt.Header().PacketSequenceNumber.Dec(),
+			})
 		}
-
 		len := uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber))
 		r.statistics.PktLoss += len
 		r.statistics.ByteLoss += len * uint64(r.avgPayloadSize)
-
 		r.maxSeenSequenceNumber = pkt.Header().PacketSequenceNumber
 	}
 
 	r.statistics.PktBuf++
 	r.statistics.PktUnique++
-
 	r.statistics.ByteBuf += pktLen
 	r.statistics.ByteUnique += pktLen
 
@@ -327,29 +383,25 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 	e := r.packetList.Front()
 	if e != nil {
 		p := e.Value.(packet.Packet)
-
 		minPktTsbpdTime = p.Header().PktTsbpdTime
 		maxPktTsbpdTime = p.Header().PktTsbpdTime
 	}
 
-	// Find the sequence number up until we have all in a row.
-	// Where the first gap is (or at the end of the list) is where we can ACK to.
-
+	// For bonding: ACK can advance past gaps within lossMaxTTL
+	// This tells the sender "I got everything up to here" even if there are gaps
+	// The reorder buffer in Tick() handles actual delivery order
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
 
-		// Skip packets that we already ACK'd.
 		if p.Header().PacketSequenceNumber.Lte(ackSequenceNumber) {
 			continue
 		}
 
-		// If there are packets that should have been delivered by now, move forward.
 		if p.Header().PktTsbpdTime <= now {
 			ackSequenceNumber = p.Header().PacketSequenceNumber
 			continue
 		}
 
-		// Check if the packet is the next in the row.
 		if p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
 			ackSequenceNumber = p.Header().PacketSequenceNumber
 			maxPktTsbpdTime = p.Header().PktTsbpdTime
@@ -357,9 +409,7 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 			continue
 		}
 
-		// Patch D: When lossMaxTTL is configured (SRTLA bonding), allow ACK to advance
-		// past gaps within reorder tolerance. Without this, lastACKSequenceNumber stalls
-		// at the first gap, preventing Tick() from delivering packets ahead of the gap.
+		// For bonding: skip gaps within tolerance for ACK advancement
 		if r.lossMaxTTL > 0 {
 			gapSize := p.Header().PacketSequenceNumber.Distance(ackSequenceNumber.Inc())
 			if gapSize <= r.lossMaxTTL {
@@ -376,10 +426,7 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 	ok = true
 	sequenceNumber = ackSequenceNumber.Inc()
 
-	// Keep track of the last ACK's sequence number. With this we can faster ignore
-	// packets that come in late that have a lower sequence number.
 	r.lastACKSequenceNumber = ackSequenceNumber
-
 	r.lastPeriodicACK = now
 	r.nPackets = 0
 
@@ -396,32 +443,21 @@ func (r *receiver) periodicNAK(now uint64) []circular.Number {
 
 	list := []circular.Number{}
 
-	// Send a periodic NAK
-
 	ackSequenceNumber := r.lastACKSequenceNumber
 
-	// Send a NAK for gaps that exceed lossMaxTTL (SRTLA bonding tolerance).
-	// When lossMaxTTL > 0, gaps within tolerance are NOT NAKged immediately,
-	// giving reordered packets time to arrive via alternate bonding paths.
-	// Not all gaps might get announced because the size of the NAK packet is limited.
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
 
-		// Skip packets that we already ACK'd.
 		if p.Header().PacketSequenceNumber.Lte(ackSequenceNumber) {
 			continue
 		}
 
-		// If this packet is not in sequence, we stop here and report that gap
-		// only if it exceeds the reorder tolerance (lossMaxTTL).
 		if !p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
 			gapStart := ackSequenceNumber.Inc()
 			gapEnd := p.Header().PacketSequenceNumber.Dec()
 			gapSize := gapEnd.Distance(gapStart)
 
-			// Patch A: When lossMaxTTL is configured, suppress NAK for gaps within tolerance.
-			// This allows reordered packets from slower bonding paths to arrive before
-			// the receiver requests retransmission. Matches BELABOX/IRLServer C SRT patch.
+			// Suppress NAK for gaps within lossMaxTTL (bonding tolerance)
 			if r.lossMaxTTL > 0 && gapSize <= r.lossMaxTTL {
 				ackSequenceNumber = p.Header().PacketSequenceNumber
 				continue
@@ -439,6 +475,67 @@ func (r *receiver) periodicNAK(now uint64) []circular.Number {
 	return list
 }
 
+// tryDeliver attempts to deliver packets from packetList in strict sequence order.
+// Only delivers if the next expected sequence is available and its TSBPD time has expired.
+// Returns true if any packet was delivered.
+func (r *receiver) tryDeliver(now uint64) bool {
+	delivered := false
+
+	for {
+		// Check if nextDeliverySeq is in packetList
+		found := false
+		for e := r.packetList.Front(); e != nil; e = e.Next() {
+			p := e.Value.(packet.Packet)
+			if p.Header().PacketSequenceNumber == r.nextDeliverySeq {
+				// Found the next packet to deliver
+				if p.Header().PktTsbpdTime <= now {
+					r.packetList.Remove(e)
+					r.statistics.PktBuf--
+					r.statistics.ByteBuf -= p.Len()
+					r.lastDeliveredSequenceNumber = r.nextDeliverySeq
+					r.deliver(p)
+					r.nextDeliverySeq = r.nextDeliverySeq.Inc()
+					r.lastDeliveryAdvance = time.Now()
+					delivered = true
+					// Continue trying to deliver consecutive packets
+					continue
+				}
+				// TSBPD time not yet expired, wait
+				return delivered
+			}
+			if p.Header().PacketSequenceNumber.Gt(r.nextDeliverySeq) {
+				// Gap: nextDeliverySeq is not in the list
+				break
+			}
+		}
+
+		if !found {
+			// nextDeliverySeq not found in packetList
+			// Check stale timeout: if we haven't advanced in a while, skip the gap
+			if len(r.pendingDelivery) > 0 || !found {
+				elapsed := time.Since(r.lastDeliveryAdvance).Milliseconds()
+				if int(elapsed) >= r.deliveryStaleMs {
+					// Skip the gap: advance nextDeliverySeq
+					// But only if there are packets ahead in the list
+					if r.packetList.Len() > 0 {
+						front := r.packetList.Front().Value.(packet.Packet)
+						if front.Header().PacketSequenceNumber.Gt(r.nextDeliverySeq) {
+							// Skip to the first available packet
+							r.nextDeliverySeq = front.Header().PacketSequenceNumber
+							r.lastDeliveryAdvance = time.Now()
+							// Continue the loop to try delivering
+							continue
+						}
+					}
+				}
+			}
+			break
+		}
+	}
+
+	return delivered
+}
+
 func (r *receiver) Tick(now uint64) {
 	if ok, sequenceNumber, lite := r.periodicACK(now); ok {
 		r.sendACK(sequenceNumber, lite)
@@ -448,29 +545,36 @@ func (r *receiver) Tick(now uint64) {
 		r.sendNAK(list)
 	}
 
-	// Deliver packets whose PktTsbpdTime is ripe
-	r.lock.Lock()
-	removeList := make([]*list.Element, 0, r.packetList.Len())
-	for e := r.packetList.Front(); e != nil; e = e.Next() {
-		p := e.Value.(packet.Packet)
+	// REORDER BUFFER DELIVERY: deliver packets in strict sequence order
+	if r.lossMaxTTL > 0 {
+		r.lock.Lock()
+		r.tryDeliver(now)
+		r.lock.Unlock()
+	} else {
+		// ORIGINAL DELIVERY (no bonding): deliver in list order
+		r.lock.Lock()
+		removeList := make([]*list.Element, 0, r.packetList.Len())
+		for e := r.packetList.Front(); e != nil; e = e.Next() {
+			p := e.Value.(packet.Packet)
 
-		if p.Header().PacketSequenceNumber.Lte(r.lastACKSequenceNumber) && p.Header().PktTsbpdTime <= now {
-			r.statistics.PktBuf--
-			r.statistics.ByteBuf -= p.Len()
+			if p.Header().PacketSequenceNumber.Lte(r.lastACKSequenceNumber) && p.Header().PktTsbpdTime <= now {
+				r.statistics.PktBuf--
+				r.statistics.ByteBuf -= p.Len()
 
-			r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber
+				r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber
 
-			r.deliver(p)
-			removeList = append(removeList, e)
-		} else {
-			break
+				r.deliver(p)
+				removeList = append(removeList, e)
+			} else {
+				break
+			}
 		}
-	}
 
-	for _, e := range removeList {
-		r.packetList.Remove(e)
+		for _, e := range removeList {
+			r.packetList.Remove(e)
+		}
+		r.lock.Unlock()
 	}
-	r.lock.Unlock()
 
 	r.lock.Lock()
 	tdiff := now - r.rate.last // microseconds
@@ -503,7 +607,9 @@ func (r *receiver) SetNAKInterval(nakInterval uint64) {
 func (r *receiver) String(t uint64) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf("maxSeen=%d lastACK=%d lastDelivered=%d\n", r.maxSeenSequenceNumber.Val(), r.lastACKSequenceNumber.Val(), r.lastDeliveredSequenceNumber.Val()))
+	b.WriteString(fmt.Sprintf("maxSeen=%d lastACK=%d lastDelivered=%d nextDelivery=%d pending=%d\n",
+		r.maxSeenSequenceNumber.Val(), r.lastACKSequenceNumber.Val(),
+		r.lastDeliveredSequenceNumber.Val(), r.nextDeliverySeq.Val(), len(r.pendingDelivery)))
 
 	r.lock.RLock()
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
