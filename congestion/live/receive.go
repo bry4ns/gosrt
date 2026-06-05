@@ -68,10 +68,9 @@ type receiver struct {
 
 	// Reorder buffer: delivers packets in strict sequence order.
 	// Handles SRTLA bonding where packets arrive out of order from multiple SIMs.
-	nextDeliverySeq    circular.Number                // next sequence to deliver to application
-	pendingDelivery    map[uint32]packet.Packet       // seq -> packet, buffered for delivery
-	lastDeliveryAdvance time.Time                     // when nextDeliverySeq last advanced
-	deliveryStaleMs    int                           // stale timeout in ms (from LossMaxTTL * 2)
+	nextDeliverySeq     circular.Number           // next sequence to deliver to application
+	lastDeliveryAdvance time.Time                 // when nextDeliverySeq last advanced
+	deliveryStaleMs     int                       // stale timeout in ms (from LossMaxTTL * 2)
 }
 
 // NewReceiver takes a ReceiveConfig and returns a new Receiver
@@ -101,10 +100,9 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 		deliver: config.OnDeliver,
 
 		// Reorder buffer init
-		nextDeliverySeq:    config.InitialSequenceNumber.Dec(),
-		pendingDelivery:    make(map[uint32]packet.Packet),
+		nextDeliverySeq:     config.InitialSequenceNumber.Dec(),
 		lastDeliveryAdvance: time.Now(),
-		deliveryStaleMs:    staleMs,
+		deliveryStaleMs:     staleMs,
 	}
 
 	if r.sendACK == nil {
@@ -153,7 +151,6 @@ func (r *receiver) Flush() {
 	defer r.lock.Unlock()
 
 	r.packetList = r.packetList.Init()
-	r.pendingDelivery = make(map[uint32]packet.Packet)
 }
 
 func (r *receiver) Push(pkt packet.Packet) {
@@ -484,10 +481,12 @@ func (r *receiver) tryDeliver(now uint64) bool {
 	for {
 		// Check if nextDeliverySeq is in packetList
 		found := false
+		gapDetected := false
 		for e := r.packetList.Front(); e != nil; e = e.Next() {
 			p := e.Value.(packet.Packet)
 			if p.Header().PacketSequenceNumber == r.nextDeliverySeq {
 				// Found the next packet to deliver
+				found = true
 				if p.Header().PktTsbpdTime <= now {
 					r.packetList.Remove(e)
 					r.statistics.PktBuf--
@@ -505,29 +504,33 @@ func (r *receiver) tryDeliver(now uint64) bool {
 			}
 			if p.Header().PacketSequenceNumber.Gt(r.nextDeliverySeq) {
 				// Gap: nextDeliverySeq is not in the list
+				gapDetected = true
 				break
 			}
 		}
 
-		if !found {
-			// nextDeliverySeq not found in packetList
+		if !found && gapDetected {
+			// nextDeliverySeq not in packetList, but packets exist ahead
 			// Check stale timeout: if we haven't advanced in a while, skip the gap
-			if len(r.pendingDelivery) > 0 || !found {
-				elapsed := time.Since(r.lastDeliveryAdvance).Milliseconds()
-				if int(elapsed) >= r.deliveryStaleMs {
-					// Skip the gap: advance nextDeliverySeq
-					// But only if there are packets ahead in the list
-					if r.packetList.Len() > 0 {
-						front := r.packetList.Front().Value.(packet.Packet)
-						if front.Header().PacketSequenceNumber.Gt(r.nextDeliverySeq) {
-							// Skip to the first available packet
-							r.nextDeliverySeq = front.Header().PacketSequenceNumber
-							r.lastDeliveryAdvance = time.Now()
-							// Continue the loop to try delivering
-							continue
-						}
-					}
-				}
+			elapsed := time.Since(r.lastDeliveryAdvance).Milliseconds()
+			if int(elapsed) >= r.deliveryStaleMs {
+				// Skip the gap: advance nextDeliverySeq to the first available packet
+				front := r.packetList.Front().Value.(packet.Packet)
+				r.nextDeliverySeq = front.Header().PacketSequenceNumber
+				r.lastDeliveryAdvance = time.Now()
+				// Don't deliver yet, let the next iteration handle it
+				continue
+			}
+			// Not stale yet, wait for the missing packet
+			break
+		}
+
+		if !found && !gapDetected {
+			// packetList is empty or all packets have seq < nextDeliverySeq
+			// Check stale timeout for empty list case
+			elapsed := time.Since(r.lastDeliveryAdvance).Milliseconds()
+			if int(elapsed) >= r.deliveryStaleMs && r.packetList.Len() == 0 {
+				// List is empty and stale, nothing to do
 			}
 			break
 		}
@@ -607,9 +610,9 @@ func (r *receiver) SetNAKInterval(nakInterval uint64) {
 func (r *receiver) String(t uint64) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf("maxSeen=%d lastACK=%d lastDelivered=%d nextDelivery=%d pending=%d\n",
+	b.WriteString(fmt.Sprintf("maxSeen=%d lastACK=%d lastDelivered=%d nextDelivery=%d\n",
 		r.maxSeenSequenceNumber.Val(), r.lastACKSequenceNumber.Val(),
-		r.lastDeliveredSequenceNumber.Val(), r.nextDeliverySeq.Val(), len(r.pendingDelivery)))
+		r.lastDeliveredSequenceNumber.Val(), r.nextDeliverySeq.Val()))
 
 	r.lock.RLock()
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
