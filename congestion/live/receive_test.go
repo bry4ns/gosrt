@@ -636,10 +636,12 @@ func TestRecvLossMaxTTL(t *testing.T) {
 		PeriodicACKInterval:   10,
 		PeriodicNAKInterval:   20,
 		OnSendACK:             nil,
-		OnSendNAK: func(from, to circular.Number) {
+		OnSendNAK: func(list []circular.Number) {
 			nNAK++
-			seqNAKFrom = from.Val()
-			seqNAKTo = to.Val()
+			if len(list) >= 2 {
+				seqNAKFrom = list[0].Val()
+				seqNAKTo = list[1].Val()
+			}
 		},
 		OnDeliver:             nil,
 		LossMaxTTL:            30, // tolerar desorden hasta 30 paquetes
