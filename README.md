@@ -1,59 +1,62 @@
-# GoSRT - Fork Optimizado para Bonding Celular y SRTLA
+# GoSRT - High-Performance Fork for SRTLA and Cellular Bonding
 
-Este repositorio es un **fork optimizado** de la implementación pura en Go del protocolo SRT (`github.com/datarhei/gosrt`). Ha sido diseñado y parcheado específicamente para integrarse con sistemas de agregación de enlaces celular (Bonding) y pasarelas **SRTLA** (como `perhost-nodes`), garantizando estabilidad extrema bajo pérdida de paquetes y fluctuaciones drásticas de latencia.
+This repository is an optimized fork of the pure Go SRT protocol implementation (`github.com/datarhei/gosrt`). 
 
----
-
-## ⚠️ Limitaciones Aceptadas de GoSRT (Qué NO Soporta)
-
-Para mantener el código simple, de alto rendimiento y enfocado al streaming de video en vivo (Live Streaming), **aceptamos y no implementamos** las siguientes características del protocolo SRT estándar de Haivision:
-
-*   **❌ Buffer Mode**: No se soporta el modo de búfer genérico (file transfer). Solo se implementa el modo **Live (TSBPD)** para transmisión de video en tiempo real.
-*   **❌ Rendezvous Handshake**: Solo se soportan los modos de conexión **Caller (Cliente)** y **Listener (Servidor)**. No se admite la negociación directa simultánea (Rendezvous).
-*   **❌ File Transfer Congestion Control (FileCC)**: No se incluye control de congestión para transferencia de archivos. El congestion control nativo es **LiveCC** (específico para transmisiones en vivo).
-*   **❌ Connection Bonding Nativo**: GoSRT **no maneja agregación de enlaces internamente**. La agregación se delega por completo a la capa de transporte superior **SRTLA** en el nodo receptor, el cual se encarga de reordenar y desempaquetar las transmisiones multiruta antes de inyectarlas en esta librería.
+It has been customized and patched by the **perhost.app** team specifically for integration with multi-link cellular bonding gateways and **SRTLA receivers** (such as `irlserver` or similar streaming ingestion nodes). It is designed to remain extremely stable under high packet loss, severe jitter, and significant latency differentials across bonding links.
 
 ---
 
-## 🚀 Modificaciones e Inyecciones de este Fork
+## ⚠️ Accepted Limitations (What is NOT supported)
 
-Este fork introduce parches fundamentales para corregir cuellos de botella de CPU y tormentas de retransmisión que ocurren en redes móviles bonded:
+To keep the codebase lightweight, highly performant, and focused on low-latency live streaming, we accept and do not implement the following features of the standard SRT protocol:
 
-### 1. Optimización del Algoritmo de Reordenamiento $O(1)$
-*   **Problema original**: La cola de recepción nativa de `gosrt` (`packetList`) realizaba una búsqueda lineal desde el primer elemento (`Front()`) para insertar paquetes desordenados. Con bonding celular (WiFi + múltiples SIMs), el tráfico desordenado es masivo y constante. Esto generaba una complejidad $O(N^2)$ que saturaba la CPU del servidor, causando descartes de paquetes y congelamiento de imagen.
-*   **Solución**: Se modificó el algoritmo de inserción en `receive.go` para buscar en sentido inverso partiendo desde el final (`Back()` y `Prev()`). Dado que los paquetes desordenados son casi siempre recientes, la complejidad se redujo a **$O(1)$** en la práctica, logrando un rendimiento **300 veces más rápido** (100,000 paquetes se ordenan en solo **36ms**, consumiendo apenas `59ns` por paquete).
-
-### 2. Implementación Completa de `LossMaxTTL`
-*   **Propósito**: Controla el margen de tolerancia de reordenamiento antes de declarar una pérdida y disparar una solicitud de retransmisión (NAK). 
-*   **Comportamiento**: En enlaces donde las SIMs tienen latencias diferentes (ej: SIM1=40ms, SIM2=300ms), `LossMaxTTL` permite esperar una ventana de paquetes configurable (por defecto `200`) antes de enviar un NAK. Esto elimina el envío de NAKs falsos por la diferencia de velocidad entre antenas, reduciendo drásticamente el consumo de ancho de banda y la congestión celular.
-
-### 3. Optimización de Flujo NAK para SRTLA
-*   **Cambio**: Se deshabilitaron los reportes NAK periódicos periódicos (NAK Reports) para depender estrictamente de NAKs inmediatos ante la detección física de gaps. Esto evita tormentas de paquetes redundantes en redes móviles degradadas y emula el comportamiento de referencia de libsrt en implementaciones tipo BELABOX.
+*   **❌ Buffer Mode**: Not supported. Only **Live Mode (TSBPD)** is implemented for real-time video/audio streaming.
+*   **❌ Rendezvous Handshake**: Not supported. Only **Caller (Client)** and **Listener (Server)** connection modes are supported.
+*   **❌ File Transfer Congestion Control (FileCC)**: Not supported. The congestion control mechanism is exclusively **LiveCC** (designed for live video).
+*   **❌ Native Connection Bonding**: GoSRT **does not aggregate links internally**. All multi-path bonding, link registration, and packet de-encapsulation are handled by the upstream SRTLA receiver/gateway before passing the clean SRT stream to this library.
 
 ---
 
-## 🛠️ Cómo Utilizar en tu Proyecto Go
+## 🚀 Fork Optimizations & Patches
 
-Para enlazar este fork optimizado en tus desarrollos (como en `perhost-nodes`), debes hacer uso de la directiva `replace` en tu archivo `go.mod`:
+This fork introduces critical enhancements to address CPU bottlenecks and retransmission storms typical of cellular bonding networks:
+
+### 1. O(1) Packet Insertion Optimization (High-Performance Queue)
+*   **The Issue**: The native `gosrt` receiver queue (`packetList`) performed a linear search starting from the oldest packet (`Front()`) to insert newly arrived packets in order. In multi-path bonding networks (WiFi + multiple SIMs), out-of-order packet arrival is constant, and late packets are usually very recent. Scanning from the front resulted in $O(N^2)$ complexity, causing severe CPU spikes, socket buffer overflows, and packet loss on the receiver.
+*   **The Solution**: We modified the queue insertion in `congestion/live/receive.go` to scan backwards from the most recent packet (`Back()`) using `Prev()`. Since out-of-order packets in bonding are almost always recent, insertion complexity becomes **$O(1)$** in practice.
+*   **The Result**: Performance is **300x faster** (processing 100,000 desynchronized packets takes just **36 ms**, averaging `59 ns` per packet). This allows gateways to discard heavy external proxy buffers and run natively with **0 ms** of software-induced delay.
+
+### 2. Full LossMaxTTL Integration
+*   **Purpose**: Governs the packet reorder tolerance window before a packet is declared lost and a NAK is sent.
+*   **Behavior**: When bonding links have mismatched latencies (e.g., SIM 1 at 40ms and SIM 2 at 350ms), standard SRT will prematurely declare packets as lost and trigger duplicate NAK storms. Setting `LossMaxTTL` (e.g., to `200`) forces SRT to wait for a specific number of subsequent packets before requesting a retransmission, allowing slower links to deliver packets naturally without triggering overhead.
+
+### 3. SRTLA-Optimized NAK Flow
+*   **Enhancement**: Disabled periodic NAK reports, relying strictly on immediate NAKs upon packet gap detection. This matches the reference behavior of libsrt in standard SRTLA gateways, preventing redundant retransmissions over congested mobile connections.
+
+---
+
+## 🛠️ Usage in Go Projects
+
+To link this optimized fork in your streaming application, use the `replace` directive in your `go.mod` file:
 
 ```go
-module tu-proyecto
+module your-project
 
 go 1.20
 
 require (
-	github.com/datarhei/gosrt v0.9.0 // Importación conceptual original
+	github.com/datarhei/gosrt v0.9.0 // Original import path
 )
 
-// Reemplazar la dependencia con este fork (rama lossmaxttl)
+// Redirect to this optimized fork (lossmaxttl branch)
 replace github.com/datarhei/gosrt => github.com/bry4ns/gosrt v0.9.0-lossmaxttl
 ```
 
 ---
 
-## 💡 Guía para Nuevos Programadores
+## 💡 Guide for Developers
 
-Si estás depurando o extendiendo este motor:
-*   **Cola de Recepción**: El archivo central que ordena y bufferiza los paquetes es `congestion/live/receive.go`. Si experimentas cortes de imagen, revisa la función `packetList.Insert()`.
-*   **Control de Pérdidas**: El control de cuándo se dispara un NAK está en `congestion/live/live.go` y es gobernado por los valores de latencia (TSBPD) configurados en el socket receptor.
-*   **Pass-Through**: Recuerda que al trabajar con SRTLA, los paquetes UDP que recibe el servidor de bonding contienen la trama SRT cruda. SRTLA simplemente remueve la cabecera SRTLA y le entrega la trama SRT completa a este módulo para que valide números de secuencia reales.
+If you are debugging or extending this SRT implementation:
+*   **Packet Queue & Reordering**: The core queue logic is located in `congestion/live/receive.go`. Inspect the `packetList.Insert()` function to see the optimized backwards-traversal logic.
+*   **NAK Generation & Latency**: NAK triggers and TSBPD playout times are managed in `congestion/live/live.go` and are governed by the latency settings applied to the receiver socket.
+*   **Decapsulation**: When receiving SRTLA streams, the incoming UDP packets have the SRTLA header stripped by the gateway before being forwarded to the GoSRT listener socket. This library processes the original SRT sequence numbers to close the NAK/ACK recovery loop correctly.
