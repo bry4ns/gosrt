@@ -363,10 +363,20 @@ func (r *receiver) periodicNAK(now uint64) []circular.Number {
 
 		// If this packet is not in sequence, we stop here and report that gap.
 		if !p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
-			nackSequenceNumber := ackSequenceNumber.Inc()
+			nackStart := ackSequenceNumber.Inc()
+			nackEnd := p.Header().PacketSequenceNumber.Dec()
 
-			list = append(list, nackSequenceNumber)
-			list = append(list, p.Header().PacketSequenceNumber.Dec())
+			if r.lossMaxTTL > 0 {
+				nakLimit := r.maxSeenSequenceNumber.Sub(r.lossMaxTTL)
+				if nackEnd.Gte(nakLimit) {
+					nackEnd = nakLimit.Dec()
+				}
+			}
+
+			if nackStart.Lte(nackEnd) {
+				list = append(list, nackStart)
+				list = append(list, nackEnd)
+			}
 		}
 
 		ackSequenceNumber = p.Header().PacketSequenceNumber

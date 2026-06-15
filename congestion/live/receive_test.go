@@ -682,3 +682,64 @@ func TestRecvLossMaxTTL(t *testing.T) {
 	require.Equal(t, uint32(49), seqNAKTo)
 	require.Equal(t, uint32(50), recv.maxSeenSequenceNumber.Val())
 }
+
+func TestRecvPeriodicNAKLossMaxTTL(t *testing.T) {
+	recv := NewReceiver(ReceiveConfig{
+		InitialSequenceNumber: circular.New(0, packet.MAX_SEQUENCENUMBER),
+		PeriodicACKInterval:   10,
+		PeriodicNAKInterval:   20,
+		OnSendACK:             nil,
+		OnSendNAK:             nil,
+		OnDeliver:             nil,
+		LossMaxTTL:            30, // tolerar desorden hasta 30 paquetes
+	}).(*receiver)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	// 1. Envía paquetes en orden 0 a 4
+	for i := 0; i < 5; i++ {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(uint32(i), packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+		recv.Push(p)
+	}
+
+	// 2. Envía un paquete con un salto pequeño (de 4 a 15, brecha = 10 paquetes)
+	// Como la brecha (10) es <= LossMaxTTL (30), no hay NAK inmediato.
+	p := packet.NewPacket(addr)
+	p.Header().PacketSequenceNumber = circular.New(15, packet.MAX_SEQUENCENUMBER)
+	p.Header().PktTsbpdTime = 16
+	recv.Push(p)
+
+	// 3. Forzar tick de periodicNAK
+	// El gap es [5, 14]. Todos los paquetes en el gap están a una distancia de 15 (maxSeen) <= 30.
+	// Por tanto, periodicNAK no debería reportar nada.
+	list := recv.periodicNAK(30000)
+	require.Empty(t, list)
+
+	// 4. Envía un paquete con un salto más grande que LossMaxTTL (ej. de 15 a 50, brecha total de 34)
+	// Como la brecha (34) > 30, se enviará NAK inmediato para [16, 49].
+	// Pero el gap anterior [5, 14] ahora está a distancia > 30 de 50 (maxSeen).
+	// El gap [5, 14] ya no está en la ventana de tolerancia.
+	// Hacemos el tick de periodic NAK ahora. Debería reportar el gap [5, 14] porque nakLimit es 50 - 30 = 20.
+	// Así, el gap [5, 14] está por debajo de 20 y es reportado, mientras que el nuevo gap [16, 49] tiene elementos
+	// dentro de la ventana de tolerancia y solo se reportará la parte que exceda la ventana.
+	p2 := packet.NewPacket(addr)
+	p2.Header().PacketSequenceNumber = circular.New(50, packet.MAX_SEQUENCENUMBER)
+	p2.Header().PktTsbpdTime = 51
+	recv.Push(p2)
+
+	list2 := recv.periodicNAK(60000)
+	require.NotEmpty(t, list2)
+
+	// El primer gap [5, 14] debe ser completamente reportado.
+	// El segundo gap [16, 49] tiene su límite en 50 - 30 = 20.
+	// Por lo tanto, el segundo gap reportado debe estar limitado de 16 a 19.
+	// Verifiquemos si la lista contiene [5, 14] y [16, 19].
+	var vals []uint32
+	for _, n := range list2 {
+		vals = append(vals, n.Val())
+	}
+	require.Equal(t, []uint32{5, 14, 16, 19}, vals)
+}
+
