@@ -351,6 +351,11 @@ func (r *receiver) periodicNAK(now uint64) []circular.Number {
 
 	ackSequenceNumber := r.lastACKSequenceNumber
 
+	var nakLimit circular.Number
+	if r.lossMaxTTL > 0 {
+		nakLimit = r.maxSeenSequenceNumber.Sub(r.lossMaxTTL)
+	}
+
 	// Send a NAK for all gaps.
 	// Not all gaps might get announced because the size of the NAK packet is limited.
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
@@ -367,7 +372,6 @@ func (r *receiver) periodicNAK(now uint64) []circular.Number {
 			nackEnd := p.Header().PacketSequenceNumber.Dec()
 
 			if r.lossMaxTTL > 0 {
-				nakLimit := r.maxSeenSequenceNumber.Sub(r.lossMaxTTL)
 				if nackEnd.Gte(nakLimit) {
 					nackEnd = nakLimit.Dec()
 				}
