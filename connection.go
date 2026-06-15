@@ -107,8 +107,8 @@ func (r *rtt) NAKInterval() float64 {
 
 	// 4.8.2.  Packet Retransmission (NAKs)
 	nakInterval := (r.rtt + 4*r.rttVar) / 2
-	if nakInterval < 20000 {
-		nakInterval = 20000 // 20ms
+	if nakInterval < 40000 {
+		nakInterval = 40000 // 40ms
 	}
 
 	return nakInterval
@@ -300,14 +300,14 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		go c.close()
 	})
 
-	c.tick = 10 * time.Millisecond
+	c.tick = 20 * time.Millisecond
 
-	// 4.8.1.  Packet Acknowledgement (ACKs, ACKACKs) -> periodicACK = 10 milliseconds
-	// 4.8.2.  Packet Retransmission (NAKs) -> periodicNAK at least 20 milliseconds
+	// 4.8.1.  Packet Acknowledgement (ACKs, ACKACKs) -> periodicACK = 20 milliseconds
+	// 4.8.2.  Packet Retransmission (NAKs) -> periodicNAK at least 40 milliseconds
 	c.recv = live.NewReceiver(live.ReceiveConfig{
 		InitialSequenceNumber: c.initialPacketSequenceNumber,
-		PeriodicACKInterval:   10_000,
-		PeriodicNAKInterval:   20_000,
+		PeriodicACKInterval:   20_000,
+		PeriodicNAKInterval:   40_000,
 		OnSendACK:             c.sendACK,
 		OnSendNAK:             c.sendNAK,
 		OnDeliver:             c.deliver,
