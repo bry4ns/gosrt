@@ -3,4 +3,9 @@ updates:
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+    # No tocar gosrt ni la rama lossmaxttl — solo dependencias indirectas
+    ignore:
+      - dependency-name: "github.com/datarhei/gosrt"
+    reviewers: []
+    assignees: []
