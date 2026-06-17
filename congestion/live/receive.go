@@ -100,6 +100,10 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 	r.rate.last = 0
 	r.rate.period = uint64(time.Second.Microseconds())
 
+	if config.LossMaxTTL > 0 {
+		fmt.Printf("[gosrt] Receiver initialized: ring buffer O(1), LossMaxTTL=%d\n", config.LossMaxTTL)
+	}
+
 	return r
 }
 
