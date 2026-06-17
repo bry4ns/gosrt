@@ -271,6 +271,9 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 
 	ackSequenceNumber := r.lastACKSequenceNumber
 
+	minPktTsbpdTime, maxPktTsbpdTime := uint64(0), uint64(0)
+	firstFound := false
+
 	// Scan forward from lastACK+1, find consecutive ripe packets in map
 	// (skip gaps — equivalent to linked list iteration which only sees existing packets)
 	maxIter := uint32(1000)
@@ -292,9 +295,16 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 			continue
 		}
 
+		if !firstFound {
+			minPktTsbpdTime = pkt.Header().PktTsbpdTime
+			maxPktTsbpdTime = pkt.Header().PktTsbpdTime
+			firstFound = true
+		}
+
 		// If there are packets that should have been delivered by now, move forward.
 		if pkt.Header().PktTsbpdTime <= now {
 			ackSequenceNumber = checkSeq
+			maxPktTsbpdTime = pkt.Header().PktTsbpdTime
 			checkSeq = checkSeq.Inc()
 			continue
 		}
@@ -302,6 +312,7 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 		// Check if the packet is the next in the row.
 		if checkSeq.Equals(ackSequenceNumber.Inc()) {
 			ackSequenceNumber = checkSeq
+			maxPktTsbpdTime = pkt.Header().PktTsbpdTime
 			checkSeq = checkSeq.Inc()
 			continue
 		}
@@ -311,6 +322,10 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 
 	ok = true
 	sequenceNumber = ackSequenceNumber.Inc()
+
+	if firstFound && maxPktTsbpdTime > minPktTsbpdTime {
+		r.statistics.MsBuf = (maxPktTsbpdTime - minPktTsbpdTime) / 1_000
+	}
 
 	// Keep track of the last ACK's sequence number. With this we can faster ignore
 	// packets that come in late that have a lower sequence number.
